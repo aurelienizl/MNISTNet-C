@@ -1,13 +1,13 @@
-// File: mnist_dataset.h
 #ifndef MNIST_DATASET_H
 #define MNIST_DATASET_H
 #include <stdint.h>
 
+// That's remove the warning and handle errors
 #define SAFE_FREAD(ptr, size, count, stream)                           \
     do {                                                               \
         if (fread(ptr, size, count, stream) != (count)) {              \
-            perror("fread");                                        \
-            return -1;                                                \
+            perror("fread");                                           \
+            return -1;                                                 \
         }                                                              \
     } while (0)
 

@@ -1,4 +1,3 @@
-// File: main.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -12,9 +11,10 @@
 #define MAX_LR        0.02f
 #define WEIGHT_DECAY  1e-4f
 #define AUG_MAX_SHIFT 2
-#define MODEL_PATH    "model.bin"
+#define MODEL_PATH    "models/default.bin"
 
-// On-the-fly ±2px shift augmentation
+// On-the-fly ±2px shift augmentation (like this we can get more data
+// from the same image and get 1% better accuracy)
 static void augment_shift(float *dst, const float *src) {
     int dx = rand() % (2*AUG_MAX_SHIFT + 1) - AUG_MAX_SHIFT;
     int dy = rand() % (2*AUG_MAX_SHIFT + 1) - AUG_MAX_SHIFT;
@@ -47,10 +47,10 @@ int main(void) {
     srand((unsigned)time(NULL));
 
     Dataset train, test;
-    if(load_dataset("data/mnist/train-images-idx3-ubyte",
-                    "data/mnist/train-labels-idx1-ubyte",&train)) return 1;
-    if(load_dataset("data/mnist/t10k-images-idx3-ubyte",
-                    "data/mnist/t10k-labels-idx1-ubyte",&test)) return 1;
+    if(load_dataset("mnist/train-images-idx3-ubyte",
+                    "mnist/train-labels-idx1-ubyte",&train)) return 1;
+    if(load_dataset("mnist/t10k-images-idx3-ubyte",
+                    "mnist/t10k-labels-idx1-ubyte",&test)) return 1;
 
     // Normalize to [0,1]
     float *x_train = malloc(train.count * NN_INPUT * sizeof(float));

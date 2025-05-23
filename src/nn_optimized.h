@@ -1,4 +1,3 @@
-// File: nn_imlp.h
 #ifndef NN_IMLP_H
 #define NN_IMLP_H
 

@@ -1,4 +1,3 @@
-// File: nn_imlp.c
 #include "nn_optimized.h"
 #include <stdlib.h>
 #include <math.h>

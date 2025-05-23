@@ -1,4 +1,3 @@
-// File: mnist_dataset.c
 #include "mnist_dataset.h"
 #include <stdio.h>
 #include <stdlib.h>
