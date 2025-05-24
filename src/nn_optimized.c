@@ -111,79 +111,166 @@ void nn_forward_batch(const float *x,
 void nn_backward_batch(const float *x,
                        const float *h1, const float *h2,
                        const float *y, const uint8_t *lbls,
-                       uint32_t bs) {
-    // accumulate grads
-    static float dW1[NN_HIDDEN1][NN_INPUT], dB1[NN_HIDDEN1];
-    static float dW2[NN_HIDDEN2][NN_HIDDEN1], dB2[NN_HIDDEN2];
-    static float dW3[NN_OUTPUT][NN_HIDDEN2], dB3[NN_OUTPUT];
-    // zero
-    for(int i=0;i<NN_HIDDEN1;i++) { dB1[i]=0; memset(dW1[i],0,NN_INPUT*sizeof(float)); }
-    for(int i=0;i<NN_HIDDEN2;i++) { dB2[i]=0; memset(dW2[i],0,NN_HIDDEN1*sizeof(float)); }
-    for(int k=0;k<NN_OUTPUT;k++) { dB3[k]=0; memset(dW3[k],0,NN_HIDDEN2*sizeof(float)); }
+                       uint32_t bs)
+{
+    // Number of threads
+    int T = omp_get_max_threads();
 
-    for(uint32_t b=0;b<bs;b++){
-        const float *xb = x + b*NN_INPUT;
-        const float *hh1 = h1 + b*NN_HIDDEN1;
-        const float *hh2 = h2 + b*NN_HIDDEN2;
-        const float *yy  = y  + b*NN_OUTPUT;
-        int lbl = lbls[b];
-        // output delta
-        float delta3[NN_OUTPUT];
-        for(int k=0;k<NN_OUTPUT;k++){
-            delta3[k] = yy[k] - (k==lbl);
-            dB3[k] += delta3[k];
-            for(int i=0;i<NN_HIDDEN2;i++)
-                dW3[k][i] += delta3[k]*hh2[i];
-        }
-        // layer2 delta
-        float delta2[NN_HIDDEN2];
-        for(int i=0;i<NN_HIDDEN2;i++){
-            float s=0;
-            for(int k=0;k<NN_OUTPUT;k++) s += W3[k][i]*delta3[k];
-            delta2[i] = s * drelu(hh2[i]);
-            dB2[i] += delta2[i];
-            for(int j=0;j<NN_HIDDEN1;j++)
-                dW2[i][j] += delta2[i]*hh1[j];
-        }
-        // layer1 delta
-        for(int i=0;i<NN_HIDDEN1;i++){
-            float s=0;
-            for(int j=0;j<NN_HIDDEN2;j++) s += W2[j][i]*delta2[j];
-            float d = s * drelu(hh1[i]);
-            dB1[i] += d;
-            for(int j=0;j<NN_INPUT;j++)
-                dW1[i][j] += d*xb[j];
+    // Sizes of per-layer gradient buffers
+    size_t sz1 = (size_t)NN_HIDDEN1 * NN_INPUT;
+    size_t sz2 = (size_t)NN_HIDDEN2 * NN_HIDDEN1;
+    size_t sz3 = (size_t)NN_OUTPUT   * NN_HIDDEN2;
+
+    // Allocate per-thread gradient buffers, zero-initialized
+    float *l_dW1 = calloc((size_t)T * sz1, sizeof(float));
+    float *l_dB1 = calloc((size_t)T * NN_HIDDEN1, sizeof(float));
+    float *l_dW2 = calloc((size_t)T * sz2, sizeof(float));
+    float *l_dB2 = calloc((size_t)T * NN_HIDDEN2, sizeof(float));
+    float *l_dW3 = calloc((size_t)T * sz3, sizeof(float));
+    float *l_dB3 = calloc((size_t)T * NN_OUTPUT,   sizeof(float));
+
+    // Parallel accumulation into thread-local buffers
+    #pragma omp parallel
+    {
+        int t = omp_get_thread_num();
+        float *dW1_t = l_dW1 + (size_t)t * sz1;
+        float *dB1_t = l_dB1 + (size_t)t * NN_HIDDEN1;
+        float *dW2_t = l_dW2 + (size_t)t * sz2;
+        float *dB2_t = l_dB2 + (size_t)t * NN_HIDDEN2;
+        float *dW3_t = l_dW3 + (size_t)t * sz3;
+        float *dB3_t = l_dB3 + (size_t)t * NN_OUTPUT;
+
+        #pragma omp for schedule(static)
+        for(uint32_t b = 0; b < bs; b++){
+            const float *xb  = x  + b*NN_INPUT;
+            const float *h1b = h1 + b*NN_HIDDEN1;
+            const float *h2b = h2 + b*NN_HIDDEN2;
+            const float *ybk = y  + b*NN_OUTPUT;
+            int          lbl = lbls[b];
+
+            // --- output layer ---
+            float delta3[NN_OUTPUT];
+            for(int k = 0; k < NN_OUTPUT; k++){
+                delta3[k] = ybk[k] - (k == lbl);
+                dB3_t[k] += delta3[k];
+                for(int i = 0; i < NN_HIDDEN2; i++){
+                    dW3_t[(size_t)k*NN_HIDDEN2 + i] += delta3[k] * h2b[i];
+                }
+            }
+
+            // --- hidden layer 2 ---
+            float delta2[NN_HIDDEN2];
+            for(int i = 0; i < NN_HIDDEN2; i++){
+                float s = 0;
+                for(int k = 0; k < NN_OUTPUT; k++){
+                    s += W3[k][i] * delta3[k];
+                }
+                delta2[i] = s * drelu(h2b[i]);
+                dB2_t[i] += delta2[i];
+                for(int j = 0; j < NN_HIDDEN1; j++){
+                    dW2_t[(size_t)i*NN_HIDDEN1 + j] += delta2[i] * h1b[j];
+                }
+            }
+
+            // --- hidden layer 1 ---
+            for(int i = 0; i < NN_HIDDEN1; i++){
+                float s = 0;
+                for(int j = 0; j < NN_HIDDEN2; j++){
+                    s += W2[j][i] * delta2[j];
+                }
+                float d = s * drelu(h1b[i]);
+                dB1_t[i] += d;
+                for(int j = 0; j < NN_INPUT; j++){
+                    dW1_t[(size_t)i*NN_INPUT + j] += d * xb[j];
+                }
+            }
         }
     }
 
-    // update with momentum + weight decay
-    for(int i=0;i<NN_HIDDEN1;i++){
-        VdB1[i] = MOM*VdB1[i] - (LR/bs)*dB1[i];
-        B1[i] += VdB1[i];
-        for(int j=0;j<NN_INPUT;j++){
-            float grad = (dW1[i][j]/bs) + WD*W1[i][j];
-            VdW1[i][j] = MOM*VdW1[i][j] - LR*grad;
-            W1[i][j] += VdW1[i][j];
+    // --- Parallel reduction + weight update ---
+
+    // Layer 1 biases
+    #pragma omp parallel for schedule(static)
+    for(int i = 0; i < NN_HIDDEN1; i++){
+        float g = 0;
+        for(int t = 0; t < T; t++){
+            g += l_dB1[(size_t)t*NN_HIDDEN1 + i];
+        }
+        g /= bs;
+        VdB1[i] = MOM*VdB1[i] - LR*g;
+        B1[i]  += VdB1[i];
+    }
+
+    // Layer 1 weights
+    #pragma omp parallel for collapse(2) schedule(static)
+    for(int i = 0; i < NN_HIDDEN1; i++){
+        for(int j = 0; j < NN_INPUT; j++){
+            float g = 0;
+            for(int t = 0; t < T; t++){
+                g += l_dW1[(size_t)t*sz1 + (size_t)i*NN_INPUT + j];
+            }
+            g = g/bs + WD*W1[i][j];
+            VdW1[i][j] = MOM*VdW1[i][j] - LR*g;
+            W1[i][j]  += VdW1[i][j];
         }
     }
-    for(int i=0;i<NN_HIDDEN2;i++){
-        VdB2[i] = MOM*VdB2[i] - (LR/bs)*dB2[i];
-        B2[i] += VdB2[i];
-        for(int j=0;j<NN_HIDDEN1;j++){
-            float grad = (dW2[i][j]/bs) + WD*W2[i][j];
-            VdW2[i][j] = MOM*VdW2[i][j] - LR*grad;
-            W2[i][j] += VdW2[i][j];
+
+    // Layer 2 biases
+    #pragma omp parallel for schedule(static)
+    for(int i = 0; i < NN_HIDDEN2; i++){
+        float g = 0;
+        for(int t = 0; t < T; t++){
+            g += l_dB2[(size_t)t*NN_HIDDEN2 + i];
+        }
+        g /= bs;
+        VdB2[i] = MOM*VdB2[i] - LR*g;
+        B2[i]  += VdB2[i];
+    }
+
+    // Layer 2 weights
+    #pragma omp parallel for collapse(2) schedule(static)
+    for(int i = 0; i < NN_HIDDEN2; i++){
+        for(int j = 0; j < NN_HIDDEN1; j++){
+            float g = 0;
+            for(int t = 0; t < T; t++){
+                g += l_dW2[(size_t)t*sz2 + (size_t)i*NN_HIDDEN1 + j];
+            }
+            g = g/bs + WD*W2[i][j];
+            VdW2[i][j] = MOM*VdW2[i][j] - LR*g;
+            W2[i][j]  += VdW2[i][j];
         }
     }
-    for(int k=0;k<NN_OUTPUT;k++){
-        VdB3[k] = MOM*VdB3[k] - (LR/bs)*dB3[k];
-        B3[k] += VdB3[k];
-        for(int i=0;i<NN_HIDDEN2;i++){
-            float grad = (dW3[k][i]/bs) + WD*W3[k][i];
-            VdW3[k][i] = MOM*VdW3[k][i] - LR*grad;
-            W3[k][i] += VdW3[k][i];
+
+    // Layer 3 biases
+    #pragma omp parallel for schedule(static)
+    for(int k = 0; k < NN_OUTPUT; k++){
+        float g = 0;
+        for(int t = 0; t < T; t++){
+            g += l_dB3[(size_t)t*NN_OUTPUT + k];
+        }
+        g /= bs;
+        VdB3[k] = MOM*VdB3[k] - LR*g;
+        B3[k]  += VdB3[k];
+    }
+
+    // Layer 3 weights
+    #pragma omp parallel for collapse(2) schedule(static)
+    for(int k = 0; k < NN_OUTPUT; k++){
+        for(int i = 0; i < NN_HIDDEN2; i++){
+            float g = 0;
+            for(int t = 0; t < T; t++){
+                g += l_dW3[(size_t)t*sz3 + (size_t)k*NN_HIDDEN2 + i];
+            }
+            g = g/bs + WD*W3[k][i];
+            VdW3[k][i] = MOM*VdW3[k][i] - LR*g;
+            W3[k][i]  += VdW3[k][i];
         }
     }
+
+    // Free thread-local buffers
+    free(l_dW1); free(l_dB1);
+    free(l_dW2); free(l_dB2);
+    free(l_dW3); free(l_dB3);
 }
 
 double nn_evaluate(const float *x,
@@ -197,17 +284,20 @@ double nn_evaluate(const float *x,
         float h1[NN_HIDDEN1], h2[NN_HIDDEN2], z[NN_OUTPUT];
         for(int ii=0;ii<NN_HIDDEN1;ii++){
             float s = B1[ii];
+            #pragma omp simd
             for(int jj=0;jj<NN_INPUT;jj++) s += W1[ii][jj]*xb[jj];
             h1[ii] = relu(s);
         }
         for(int ii=0;ii<NN_HIDDEN2;ii++){
             float s = B2[ii];
+            #pragma omp simd
             for(int jj=0;jj<NN_HIDDEN1;jj++) s += W2[ii][jj]*h1[jj];
             h2[ii] = relu(s);
         }
         float maxz = -INFINITY;
         for(int k=0;k<NN_OUTPUT;k++){
             float s = B3[k];
+            #pragma omp simd
             for(int j=0;j<NN_HIDDEN2;j++) s += W3[k][j]*h2[j];
             z[k]=s;
             if(s>maxz) maxz=s;
