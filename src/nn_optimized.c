@@ -1,110 +1,158 @@
+/* nn_optimized.c (factorized) */
 #include "nn_optimized.h"
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
 #include <stdio.h>
-#include <string.h>
-#ifdef _OPENMP
 #include <omp.h>
-#endif
 
-// Parameters
+// Hyperparameters
+static float LR = 0.01f;
+static float WD = 1e-4f;
+static const float MOM = 0.9f;
+
+// Parameters and momentum buffers
 static float W1[NN_HIDDEN1][NN_INPUT], B1[NN_HIDDEN1];
-static float W2[NN_HIDDEN2][NN_HIDDEN1], B2[NN_HIDDEN2];    
+static float W2[NN_HIDDEN2][NN_HIDDEN1], B2[NN_HIDDEN2];
 static float W3[NN_OUTPUT][NN_HIDDEN2], B3[NN_OUTPUT];
-
-// Momentum terms
 static float VdW1[NN_HIDDEN1][NN_INPUT], VdB1[NN_HIDDEN1];
 static float VdW2[NN_HIDDEN2][NN_HIDDEN1], VdB2[NN_HIDDEN2];
 static float VdW3[NN_OUTPUT][NN_HIDDEN2], VdB3[NN_OUTPUT];
 
-// Hyperparams
-static float LR = 0.01f;
-static float WD = 1e-4f;    // L2 weight decay
-static const float MOM = 0.9f;
-
-// helpers
+// Activation
 static inline float relu(float x) { return x > 0 ? x : 0; }
-static inline float drelu(float x) { return x > 0 ? 1 : 0; }
+static inline float drelu(float y) { return y > 0 ? 1 : 0; }
 
-// uniform random in [-a,a]
-static float urand(float a) {
-    return ((rand()/(float)RAND_MAX)*2 - 1)*a;
+// Xavier initialization
+static float xavier(int in, int out)
+{
+    return ((rand() / (float)RAND_MAX) * 2.f - 1.f) * sqrtf(6.f / (in + out));
 }
 
-void nn_set_hyper(float lr, float weight_decay) {
+// Generic fully-connected forward
+static void layer_forward(const float *restrict in, int in_dim,
+                          const float *bias, const float *restrict W,
+                          int out_dim, float (*act)(float),
+                          float *restrict out)
+{
+    for (int i = 0; i < out_dim; i++)
+    {
+        float s = bias[i];
+#pragma omp simd
+        for (int j = 0; j < in_dim; j++)
+            s += W[i * in_dim + j] * in[j];
+        out[i] = act ? act(s) : s;
+    }
+}
+
+// Max-stable softmax
+static void softmax(const float *z, int n, float *out)
+{
+    float m = z[0];
+#pragma omp simd reduction(max : m)
+    for (int i = 1; i < n; i++)
+        m = fmaxf(m, z[i]);
+    float sum = 0;
+#pragma omp simd reduction(+ : sum)
+    for (int i = 0; i < n; i++)
+        sum += (out[i] = expf(z[i] - m));
+#pragma omp simd
+    for (int i = 0; i < n; i++)
+        out[i] /= sum;
+}
+
+// Backprop through one relu layer
+static void layer_back_relu(const float *delta_next, const float *W_next,
+                            int out_dim, int in_dim,
+                            const float *act_prev, float *delta)
+{
+#pragma omp simd
+    for (int i = 0; i < in_dim; i++)
+    {
+        float s = 0;
+#pragma omp simd
+        for (int k = 0; k < out_dim; k++)
+            s += W_next[k * in_dim + i] * delta_next[k];
+        delta[i] = s * drelu(act_prev[i]);
+    }
+}
+
+// Update weights & biases with momentum & weight decay
+typedef struct
+{
+    float *W, *B, *dW, *dB, *vW, *vB;
+    int in, out;
+} Layer;
+static void update_layer(Layer L)
+{
+    for (int i = 0; i < L.out; i++)
+    {
+        float gB = L.dB[i] / L.out;
+        L.vB[i] = MOM * L.vB[i] - LR * gB;
+        L.B[i] += L.vB[i];
+#pragma omp simd
+        for (int j = 0; j < L.in; j++)
+        {
+
+            int idx = i * L.in + j;
+            float gW = L.dW[idx] / L.out + WD * L.W[idx];
+            L.vW[idx] = MOM * L.vW[idx] - LR * gW;
+            L.W[idx] += L.vW[idx];
+        }
+    }
+}
+
+void nn_set_hyper(float lr, float weight_decay)
+{
     LR = lr;
     WD = weight_decay;
 }
 
-void nn_init(void) {
+void nn_init(void)
+{
     srand((unsigned)time(NULL));
-    float s1 = sqrtf(6.0f/(NN_INPUT+NN_HIDDEN1));
-    float s2 = sqrtf(6.0f/(NN_HIDDEN1+NN_HIDDEN2));
-    float s3 = sqrtf(6.0f/(NN_HIDDEN2+NN_OUTPUT));
-    // init W/B and zero V*
-    for(int i=0;i<NN_HIDDEN1;i++){
-        B1[i]=0; VdB1[i]=0;
-        for(int j=0;j<NN_INPUT;j++){
-            W1[i][j] = urand(s1);
+    // init weights + zero momentum
+    for (int i = 0; i < NN_HIDDEN1; i++)
+        for (int j = 0; j < NN_INPUT; j++)
+        {
+            W1[i][j] = xavier(NN_INPUT, NN_HIDDEN1);
             VdW1[i][j] = 0;
         }
-    }
-    for(int i=0;i<NN_HIDDEN2;i++){
-        B2[i]=0; VdB2[i]=0;
-        for(int j=0;j<NN_HIDDEN1;j++){
-            W2[i][j] = urand(s2);
+    for (int i = 0; i < NN_HIDDEN2; i++)
+        for (int j = 0; j < NN_HIDDEN1; j++)
+        {
+            W2[i][j] = xavier(NN_HIDDEN1, NN_HIDDEN2);
             VdW2[i][j] = 0;
         }
-    }
-    for(int k=0;k<NN_OUTPUT;k++){
-        B3[k]=0; VdB3[k]=0;
-        for(int i=0;i<NN_HIDDEN2;i++){
-            W3[k][i] = urand(s3);
-            VdW3[k][i] = 0;
+    for (int i = 0; i < NN_OUTPUT; i++)
+        for (int j = 0; j < NN_HIDDEN2; j++)
+        {
+            W3[i][j] = xavier(NN_HIDDEN2, NN_OUTPUT);
+            VdW3[i][j] = 0;
         }
-    }
+    memset(B1, 0, sizeof B1);
+    memset(VdB1, 0, sizeof VdB1);
+    memset(B2, 0, sizeof B2);
+    memset(VdB2, 0, sizeof VdB2);
+    memset(B3, 0, sizeof B3);
+    memset(VdB3, 0, sizeof VdB3);
 }
 
 void nn_forward_batch(const float *x,
                       float *h1, float *h2,
-                      float *y, uint32_t bs) {
-    #pragma omp parallel for
-    for(uint32_t b=0;b<bs;b++){
-        const float *xb = x + b*NN_INPUT;
-        float *hh1 = h1 + b*NN_HIDDEN1;
-        float *hh2 = h2 + b*NN_HIDDEN2;
-        float *yy  = y  + b*NN_OUTPUT;
-        // Layer 1
-        for(int i=0;i<NN_HIDDEN1;i++){
-            float s = B1[i];
-            #pragma omp simd
-            for(int j=0;j<NN_INPUT;j++) s += W1[i][j]*xb[j];
-            hh1[i] = relu(s);
-        }
-        // Layer 2
-        for(int i=0;i<NN_HIDDEN2;i++){
-            float s = B2[i];
-            #pragma omp simd
-            for(int j=0;j<NN_HIDDEN1;j++) s += W2[i][j]*hh1[j];
-            hh2[i] = relu(s);
-        }
-        // Output + softmax
-        float maxz = -INFINITY;
+                      float *y, uint32_t bs)
+{
+    for (uint32_t b = 0; b < bs; b++)
+    {
+        const float *in = x + b * NN_INPUT;
+        float *a1 = h1 + b * NN_HIDDEN1;
+        float *a2 = h2 + b * NN_HIDDEN2;
+        float *out = y + b * NN_OUTPUT;
+        layer_forward(in, NN_INPUT, B1, &W1[0][0], NN_HIDDEN1, relu, a1);
+        layer_forward(a1, NN_HIDDEN1, B2, &W2[0][0], NN_HIDDEN2, relu, a2);
         float z[NN_OUTPUT];
-        for(int k=0;k<NN_OUTPUT;k++){
-            float s = B3[k];
-            #pragma omp simd
-            for(int i=0;i<NN_HIDDEN2;i++) s += W3[k][i]*hh2[i];
-            z[k] = s;
-            if(s>maxz) maxz=s;
-        }
-        float sum=0;
-        for(int k=0;k<NN_OUTPUT;k++){
-            yy[k] = expf(z[k]-maxz);
-            sum += yy[k];
-        }
-        for(int k=0;k<NN_OUTPUT;k++) yy[k] /= sum;
+        layer_forward(a2, NN_HIDDEN2, B3, &W3[0][0], NN_OUTPUT, NULL, z);
+        softmax(z, NN_OUTPUT, out);
     }
 }
 
@@ -113,257 +161,109 @@ void nn_backward_batch(const float *x,
                        const float *y, const uint8_t *lbls,
                        uint32_t bs)
 {
-    // Number of threads
-    int T = omp_get_max_threads();
-
-    // Sizes of per-layer gradient buffers
-    size_t sz1 = (size_t)NN_HIDDEN1 * NN_INPUT;
-    size_t sz2 = (size_t)NN_HIDDEN2 * NN_HIDDEN1;
-    size_t sz3 = (size_t)NN_OUTPUT   * NN_HIDDEN2;
-
-    // Allocate per-thread gradient buffers, zero-initialized
-    float *l_dW1 = calloc((size_t)T * sz1, sizeof(float));
-    float *l_dB1 = calloc((size_t)T * NN_HIDDEN1, sizeof(float));
-    float *l_dW2 = calloc((size_t)T * sz2, sizeof(float));
-    float *l_dB2 = calloc((size_t)T * NN_HIDDEN2, sizeof(float));
-    float *l_dW3 = calloc((size_t)T * sz3, sizeof(float));
-    float *l_dB3 = calloc((size_t)T * NN_OUTPUT,   sizeof(float));
-
-    // Parallel accumulation into thread-local buffers
-    #pragma omp parallel
+    static float dW1[NN_HIDDEN1][NN_INPUT], dB1_[NN_HIDDEN1];
+    static float dW2[NN_HIDDEN2][NN_HIDDEN1], dB2_[NN_HIDDEN2];
+    static float dW3[NN_OUTPUT][NN_HIDDEN2], dB3_[NN_OUTPUT];
+    memset(dW1, 0, sizeof dW1);
+    memset(dB1_, 0, sizeof dB1_);
+    memset(dW2, 0, sizeof dW2);
+    memset(dB2_, 0, sizeof dB2_);
+    memset(dW3, 0, sizeof dW3);
+    memset(dB3_, 0, sizeof dB3_);
+    for (uint32_t b = 0; b < bs; b++)
     {
-        int t = omp_get_thread_num();
-        float *dW1_t = l_dW1 + (size_t)t * sz1;
-        float *dB1_t = l_dB1 + (size_t)t * NN_HIDDEN1;
-        float *dW2_t = l_dW2 + (size_t)t * sz2;
-        float *dB2_t = l_dB2 + (size_t)t * NN_HIDDEN2;
-        float *dW3_t = l_dW3 + (size_t)t * sz3;
-        float *dB3_t = l_dB3 + (size_t)t * NN_OUTPUT;
-
-        #pragma omp for schedule(static)
-        for(uint32_t b = 0; b < bs; b++){
-            const float *xb  = x  + b*NN_INPUT;
-            const float *h1b = h1 + b*NN_HIDDEN1;
-            const float *h2b = h2 + b*NN_HIDDEN2;
-            const float *ybk = y  + b*NN_OUTPUT;
-            int          lbl = lbls[b];
-
-            // --- output layer ---
-            float delta3[NN_OUTPUT];
-            for(int k = 0; k < NN_OUTPUT; k++){
-                delta3[k] = ybk[k] - (k == lbl);
-                dB3_t[k] += delta3[k];
-                for(int i = 0; i < NN_HIDDEN2; i++){
-                    dW3_t[(size_t)k*NN_HIDDEN2 + i] += delta3[k] * h2b[i];
-                }
-            }
-
-            // --- hidden layer 2 ---
-            float delta2[NN_HIDDEN2];
-            for(int i = 0; i < NN_HIDDEN2; i++){
-                float s = 0;
-                for(int k = 0; k < NN_OUTPUT; k++){
-                    s += W3[k][i] * delta3[k];
-                }
-                delta2[i] = s * drelu(h2b[i]);
-                dB2_t[i] += delta2[i];
-                for(int j = 0; j < NN_HIDDEN1; j++){
-                    dW2_t[(size_t)i*NN_HIDDEN1 + j] += delta2[i] * h1b[j];
-                }
-            }
-
-            // --- hidden layer 1 ---
-            for(int i = 0; i < NN_HIDDEN1; i++){
-                float s = 0;
-                for(int j = 0; j < NN_HIDDEN2; j++){
-                    s += W2[j][i] * delta2[j];
-                }
-                float d = s * drelu(h1b[i]);
-                dB1_t[i] += d;
-                for(int j = 0; j < NN_INPUT; j++){
-                    dW1_t[(size_t)i*NN_INPUT + j] += d * xb[j];
-                }
-            }
+        const float *in = x + b * NN_INPUT;
+        const float *a1 = h1 + b * NN_HIDDEN1;
+        const float *a2 = h2 + b * NN_HIDDEN2;
+        const float *out = y + b * NN_OUTPUT;
+        int lbl = lbls[b];
+        // delta3 = out - one_hot(lbl)
+        float delta3[NN_OUTPUT];
+        for (int k = 0; k < NN_OUTPUT; k++)
+        {
+            delta3[k] = out[k] - (k == lbl);
+            dB3_[k] += delta3[k];
+            for (int i = 0; i < NN_HIDDEN2; i++)
+                dW3[k][i] += delta3[k] * a2[i];
+        }
+        // delta2
+        float delta2[NN_HIDDEN2];
+        layer_back_relu(delta3, &W3[0][0], NN_OUTPUT, NN_HIDDEN2, a2, delta2);
+        for (int i = 0; i < NN_HIDDEN2; i++)
+        {
+            dB2_[i] += delta2[i];
+            for (int j = 0; j < NN_HIDDEN1; j++)
+                dW2[i][j] += delta2[i] * a1[j];
+        }
+        // delta1
+        float delta1[NN_HIDDEN1];
+        layer_back_relu(delta2, &W2[0][0], NN_HIDDEN2, NN_HIDDEN1, a1, delta1);
+        for (int i = 0; i < NN_HIDDEN1; i++)
+        {
+            dB1_[i] += delta1[i];
+            for (int j = 0; j < NN_INPUT; j++)
+                dW1[i][j] += delta1[i] * in[j];
         }
     }
-
-    // --- Parallel reduction + weight update ---
-
-    // Layer 1 biases
-    #pragma omp parallel for schedule(static)
-    for(int i = 0; i < NN_HIDDEN1; i++){
-        float g = 0;
-        for(int t = 0; t < T; t++){
-            g += l_dB1[(size_t)t*NN_HIDDEN1 + i];
-        }
-        g /= bs;
-        VdB1[i] = MOM*VdB1[i] - LR*g;
-        B1[i]  += VdB1[i];
-    }
-
-    // Layer 1 weights
-    #pragma omp parallel for collapse(2) schedule(static)
-    for(int i = 0; i < NN_HIDDEN1; i++){
-        for(int j = 0; j < NN_INPUT; j++){
-            float g = 0;
-            for(int t = 0; t < T; t++){
-                g += l_dW1[(size_t)t*sz1 + (size_t)i*NN_INPUT + j];
-            }
-            g = g/bs + WD*W1[i][j];
-            VdW1[i][j] = MOM*VdW1[i][j] - LR*g;
-            W1[i][j]  += VdW1[i][j];
-        }
-    }
-
-    // Layer 2 biases
-    #pragma omp parallel for schedule(static)
-    for(int i = 0; i < NN_HIDDEN2; i++){
-        float g = 0;
-        for(int t = 0; t < T; t++){
-            g += l_dB2[(size_t)t*NN_HIDDEN2 + i];
-        }
-        g /= bs;
-        VdB2[i] = MOM*VdB2[i] - LR*g;
-        B2[i]  += VdB2[i];
-    }
-
-    // Layer 2 weights
-    #pragma omp parallel for collapse(2) schedule(static)
-    for(int i = 0; i < NN_HIDDEN2; i++){
-        for(int j = 0; j < NN_HIDDEN1; j++){
-            float g = 0;
-            for(int t = 0; t < T; t++){
-                g += l_dW2[(size_t)t*sz2 + (size_t)i*NN_HIDDEN1 + j];
-            }
-            g = g/bs + WD*W2[i][j];
-            VdW2[i][j] = MOM*VdW2[i][j] - LR*g;
-            W2[i][j]  += VdW2[i][j];
-        }
-    }
-
-    // Layer 3 biases
-    #pragma omp parallel for schedule(static)
-    for(int k = 0; k < NN_OUTPUT; k++){
-        float g = 0;
-        for(int t = 0; t < T; t++){
-            g += l_dB3[(size_t)t*NN_OUTPUT + k];
-        }
-        g /= bs;
-        VdB3[k] = MOM*VdB3[k] - LR*g;
-        B3[k]  += VdB3[k];
-    }
-
-    // Layer 3 weights
-    #pragma omp parallel for collapse(2) schedule(static)
-    for(int k = 0; k < NN_OUTPUT; k++){
-        for(int i = 0; i < NN_HIDDEN2; i++){
-            float g = 0;
-            for(int t = 0; t < T; t++){
-                g += l_dW3[(size_t)t*sz3 + (size_t)k*NN_HIDDEN2 + i];
-            }
-            g = g/bs + WD*W3[k][i];
-            VdW3[k][i] = MOM*VdW3[k][i] - LR*g;
-            W3[k][i]  += VdW3[k][i];
-        }
-    }
-
-    // Free thread-local buffers
-    free(l_dW1); free(l_dB1);
-    free(l_dW2); free(l_dB2);
-    free(l_dW3); free(l_dB3);
+    // update layers
+    Layer L1 = {(float *)&W1[0][0], B1, (float *)&dW1[0][0], dB1_, (float *)&VdW1[0][0], VdB1, NN_INPUT, NN_HIDDEN1};
+    Layer L2 = {(float *)&W2[0][0], B2, (float *)&dW2[0][0], dB2_, (float *)&VdW2[0][0], VdB2, NN_HIDDEN1, NN_HIDDEN2};
+    Layer L3 = {(float *)&W3[0][0], B3, (float *)&dW3[0][0], dB3_, (float *)&VdW3[0][0], VdB3, NN_HIDDEN2, NN_OUTPUT};
+    update_layer(L1);
+    update_layer(L2);
+    update_layer(L3);
 }
 
-double nn_evaluate(const float *x,
-                   const uint8_t *lbls,
-                   uint32_t N) {
+// evaluate for N samples
+
+double nn_evaluate(const float *x, const uint8_t *lbls, uint32_t N)
+{
     uint32_t correct = 0;
-    #pragma omp parallel for reduction(+:correct)
-    for(uint32_t i=0;i<N;i++){
-        // forward single
-        const float *xb = x + i*NN_INPUT;
+    for (uint32_t i = 0; i < N; i++)
+    {
+        const float *in = x + i * NN_INPUT;
         float h1[NN_HIDDEN1], h2[NN_HIDDEN2], z[NN_OUTPUT];
-        for(int ii=0;ii<NN_HIDDEN1;ii++){
-            float s = B1[ii];
-            #pragma omp simd
-            for(int jj=0;jj<NN_INPUT;jj++) s += W1[ii][jj]*xb[jj];
-            h1[ii] = relu(s);
+        layer_forward(in, NN_INPUT, B1, &W1[0][0], NN_HIDDEN1, relu, h1);
+        layer_forward(h1, NN_HIDDEN1, B2, &W2[0][0], NN_HIDDEN2, relu, h2);
+        layer_forward(h2, NN_HIDDEN2, B3, &W3[0][0], NN_OUTPUT, NULL, z);
+        // softmax & argmax
+        float maxz = z[0], sum = 0, p[NN_OUTPUT];
+        int pred = 0;
+#pragma omp simd
+        for (int k = 0; k < NN_OUTPUT; k++)
+        {
+            p[k] = expf(z[k] - maxz);
+            sum += p[k];
         }
-        for(int ii=0;ii<NN_HIDDEN2;ii++){
-            float s = B2[ii];
-            #pragma omp simd
-            for(int jj=0;jj<NN_HIDDEN1;jj++) s += W2[ii][jj]*h1[jj];
-            h2[ii] = relu(s);
+#pragma omp simd
+        for (int k = 0; k < NN_OUTPUT; k++)
+        {
+            p[k] /= sum;
+            if (p[k] > p[pred])
+                pred = k;
         }
-        float maxz = -INFINITY;
-        for(int k=0;k<NN_OUTPUT;k++){
-            float s = B3[k];
-            #pragma omp simd
-            for(int j=0;j<NN_HIDDEN2;j++) s += W3[k][j]*h2[j];
-            z[k]=s;
-            if(s>maxz) maxz=s;
-        }
-        int pred=0;
-        float bestp=-INFINITY, sum=0;
-        for(int k=0;k<NN_OUTPUT;k++){
-            float p = expf(z[k]-maxz);
-            sum += p;
-            if(p>bestp){ bestp=p; pred=k; }
-        }
-        if(pred==lbls[i]) correct++;
+        if (pred == lbls[i])
+            correct++;
     }
-    return correct/(double)N;
+    return (double)correct / N;
 }
 
-int nn_save(const char *path){
-    FILE *f = fopen(path,"wb");
-    if(!f){ perror("fopen"); return -1; }
-    fwrite(W1, sizeof(W1),1,f);
-    fwrite(B1, sizeof(B1),1,f);
-    fwrite(W2, sizeof(W2),1,f);
-    fwrite(B2, sizeof(B2),1,f);
-    fwrite(W3, sizeof(W3),1,f);
-    fwrite(B3, sizeof(B3),1,f);
-    fclose(f);
-    return 0;
-}
-
-int nn_load(const char *path){
-    FILE *f = fopen(path,"rb");
-    if(!f){ perror("fopen"); return -1; }
-    if(fread(W1, sizeof(W1),1,f)!=1) return -1;
-    if(fread(B1, sizeof(B1),1,f)!=1) return -1;
-    if(fread(W2, sizeof(W2),1,f)!=1) return -1;
-    if(fread(B2, sizeof(B2),1,f)!=1) return -1;
-    if(fread(W3, sizeof(W3),1,f)!=1) return -1;
-    if(fread(B3, sizeof(B3),1,f)!=1) return -1;
-    fclose(f);
-    return 0;
-}
-
-int nn_predict(const float *x){
+int nn_predict(const float *x)
+{
     float h1[NN_HIDDEN1], h2[NN_HIDDEN2], z[NN_OUTPUT];
-    // forward single sample (no dropout)
-    for(int i=0;i<NN_HIDDEN1;i++){
-        float s = B1[i];
-        for(int j=0;j<NN_INPUT;j++) s += W1[i][j]*x[j];
-        h1[i] = relu(s);
-    }
-    for(int i=0;i<NN_HIDDEN2;i++){
-        float s = B2[i];
-        for(int j=0;j<NN_HIDDEN1;j++) s += W2[i][j]*h1[j];
-        h2[i] = relu(s);
-    }
-    float maxz=-INFINITY;
-    for(int k=0;k<NN_OUTPUT;k++){
-        float s = B3[k];
-        for(int i=0;i<NN_HIDDEN2;i++) s += W3[k][i]*h2[i];
-        z[k] = s; if(s>maxz) maxz=s;
-    }
+    layer_forward(x, NN_INPUT, B1, &W1[0][0], NN_HIDDEN1, relu, h1);
+    layer_forward(h1, NN_HIDDEN1, B2, &W2[0][0], NN_HIDDEN2, relu, h2);
+    layer_forward(h2, NN_HIDDEN2, B3, &W3[0][0], NN_OUTPUT, NULL, z);
+    float maxz = z[0], pbest = 0;
     int pred = 0;
-    float best = -INFINITY;
-    for(int k=0;k<NN_OUTPUT;k++){
-        float p = expf(z[k]-maxz);
-        if(p > best){ best = p; pred = k; }
+    for (int k = 0; k < NN_OUTPUT; k++)
+    {
+        float p = expf(z[k] - maxz);
+        if (p > pbest)
+        {
+            pbest = p;
+            pred = k;
+        }
     }
     return pred;
 }
