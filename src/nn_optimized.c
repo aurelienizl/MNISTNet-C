@@ -19,16 +19,6 @@ static float VdW1[NN_HIDDEN1][NN_INPUT], VdB1[NN_HIDDEN1];
 static float VdW2[NN_HIDDEN2][NN_HIDDEN1], VdB2[NN_HIDDEN2];
 static float VdW3[NN_OUTPUT][NN_HIDDEN2], VdB3[NN_OUTPUT];
 
-// Activation
-static inline float relu(float x) { return x > 0 ? x : 0; }
-static inline float drelu(float y) { return y > 0 ? 1 : 0; }
-
-// Xavier initialization
-static float xavier(int in, int out)
-{
-    return ((rand() / (float)RAND_MAX) * 2.f - 1.f) * sqrtf(6.f / (in + out));
-}
-
 // Generic fully-connected forward
 static void layer_forward(const float *restrict in, int in_dim,
                           const float *bias, const float *restrict W,

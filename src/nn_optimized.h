@@ -4,17 +4,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define NN_INPUT 784
-#define NN_HIDDEN1 128
-#define NN_HIDDEN2 64
-#define NN_OUTPUT 10
-#define BATCH_SIZE 64
-#define EPOCHS 50
-#define BASE_LR 0.001f
-#define MAX_LR 0.02f
-#define WEIGHT_DECAY 1e-4f
-#define AUG_MAX_SHIFT 2
-#define MODEL_PATH "models/default.bin"
+#include "nn_config.h"
 
 // initialize weights/biases
 void nn_init(void);
